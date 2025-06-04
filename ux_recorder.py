@@ -303,11 +303,11 @@ def main():
     mp_drawing = mp.solutions.drawing_utils
     mp_drawing_styles = mp.solutions.drawing_styles
     face_mesh = mp_face_mesh.FaceMesh(
-        static_image_mode=True, # EXPERIMENTEEL: Probeer static image mode
+        static_image_mode=False, # Teruggezet naar False
         max_num_faces=1, 
         refine_landmarks=True,
         min_detection_confidence=0.7, 
-        min_tracking_confidence=0.7) # min_tracking_confidence wordt genegeerd als static_image_mode=True
+        min_tracking_confidence=0.7) 
 
     LEFT_IRIS = 468; RIGHT_IRIS = 473; LEFT_EYE_OUTER = 33; LEFT_EYE_INNER = 133
     RIGHT_EYE_INNER = 362; RIGHT_EYE_OUTER = 263; LEFT_EYE_TOP = 159; LEFT_EYE_BOTTOM = 145
@@ -339,119 +339,155 @@ def main():
     output_filename = os.path.join(output_folder, f"ux_recording_{timestamp}.avi")
     
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    fps = 15.0 # FPS verlaagd naar 15.0 voor deze test
+    fps = 5.0  # FPS verlaagd naar 5.0 voor langere video duur (was 15.0)
     video_writer = cv2.VideoWriter(output_filename, fourcc, fps, (output_video_width, output_video_height)) 
+    print(f"Video wordt opgenomen met {fps} frames per seconde - dit zorgt voor een langere opname duur")
     
     sct = mss.mss()
     monitor_grab_config = chosen_monitor_config 
     
-    overlay_cam_width = 240  # Verkleind van 320
-    overlay_cam_height = 180 # Verkleind van 240
+    overlay_cam_width = 160  # Verder verkleind van 240
+    overlay_cam_height = 120 # Verder verkleind van 180
     
+    # Herinitialiseer last_annotated_camera_frame met de nieuwe, kleinere afmetingen
+    last_annotated_camera_frame = np.zeros((overlay_cam_height, overlay_cam_width, 3), dtype=np.uint8)
+
     overlay_pos_x = output_video_width - overlay_cam_width - 10 
     overlay_pos_y = output_video_height - overlay_cam_height - 10
     
     last_time = time.time()
-    
-    # Voor gaze smoothing
     smoothed_gaze_point_abs = None
-    gaze_smoothing_factor = 0.4 # Waarde tussen 0 en 1. Hoger = minder smoothing.
+    gaze_smoothing_factor = 0.4
+
+    # Variabelen voor minder frequente MediaPipe processing
+    frame_counter_mp = 0
+    process_mediapipe_every_n_frames = 5 # Voer MP elke 5e frame uit (was 3)
+    last_smoothed_gaze_point_abs = None
+    last_looking_direction = "center"
+    last_is_blinking = False
 
     try:
-        frame_count = 0 # Voor diagnostische print
+        frame_count_diag = 0 # Voor diagnostische print (hernoemd om verwarring te voorkomen)
         while True:
             current_loop_time = time.time()
+            frame_counter_mp += 1
             
             _, camera_frame = webcam.read()
-            if camera_frame is None: print("Geen frame van webcam, stoppen."); break
+            if camera_frame is None: 
+                print("Geen frame van webcam, stoppen.")
+                # Gebruik laatste goede camerabeeld als fallback voor de laatste paar video frames
+                if 'output_frame' not in locals(): # Als dit de allereerste frame is en faalt
+                    output_frame = np.zeros((output_video_height, output_video_width, 3), dtype=np.uint8)
+                else: # Hergebruik de vorige output_frame structuur maar met laatste camera overlay
+                    resized_camera_overlay = cv2.resize(last_annotated_camera_frame, (overlay_cam_width, overlay_cam_height))
+                    if 0 <= overlay_pos_y < output_video_height and 0 <= overlay_pos_x < output_video_width and \
+                       overlay_pos_y + overlay_cam_height <= output_video_height and overlay_pos_x + overlay_cam_width <= output_video_width:
+                        output_frame[overlay_pos_y : overlay_pos_y + overlay_cam_height, 
+                                     overlay_pos_x : overlay_pos_x + overlay_cam_width] = resized_camera_overlay
+                if 'video_writer' in locals() and video_writer.isOpened(): video_writer.write(output_frame)
+                break # Stop de lus
             
-            camera_frame_rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-            results = face_mesh.process(camera_frame_rgb)
-            annotated_camera_frame = camera_frame.copy()
-            
-            gaze_point_on_monitor_abs = None 
-            left_iris_pos_rel = None 
-            right_iris_pos_rel = None 
-            is_blinking = False
-            looking_direction = "center"
-            
-            if results.multi_face_landmarks:
-                for face_landmarks in results.multi_face_landmarks:
-                    mp_drawing.draw_landmarks(
-                        image=annotated_camera_frame, landmark_list=face_landmarks,
-                        connections=mp_face_mesh.FACEMESH_TESSELATION, landmark_drawing_spec=None,
-                        connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style())
-                    mp_drawing.draw_landmarks(
-                        image=annotated_camera_frame, landmark_list=face_landmarks,
-                        connections=mp_face_mesh.FACEMESH_IRISES, landmark_drawing_spec=None,
-                        connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_iris_connections_style())
-                    
-                    h_cam, w_cam, _ = camera_frame.shape
-                    left_iris = face_landmarks.landmark[LEFT_IRIS]
-                    right_iris = face_landmarks.landmark[RIGHT_IRIS]
-                    left_iris_px_cam = (int(left_iris.x * w_cam), int(left_iris.y * h_cam))
-                    right_iris_px_cam = (int(right_iris.x * w_cam), int(right_iris.y * h_cam))
-                    left_iris_pos_rel = (left_iris.x, left_iris.y)
-                    right_iris_pos_rel = (right_iris.x, right_iris.y)
-                    
-                    cv2.circle(annotated_camera_frame, left_iris_px_cam, 5, (255, 255, 0), -1) 
-                    cv2.circle(annotated_camera_frame, right_iris_px_cam, 5, (255, 255, 0), -1) 
-                    
-                    left_eye_top_cam = (int(face_landmarks.landmark[LEFT_EYE_TOP].y * h_cam))
-                    left_eye_bottom_cam = (int(face_landmarks.landmark[LEFT_EYE_BOTTOM].y * h_cam))
-                    right_eye_top_cam = (int(face_landmarks.landmark[RIGHT_EYE_TOP].y * h_cam))
-                    right_eye_bottom_cam = (int(face_landmarks.landmark[RIGHT_EYE_BOTTOM].y * h_cam))
-                    left_eye_height_cam = left_eye_bottom_cam - left_eye_top_cam
-                    right_eye_height_cam = right_eye_bottom_cam - right_eye_top_cam
-                    
-                    if left_eye_height_cam < 5 and right_eye_height_cam < 5: 
-                        is_blinking = True
-                        cv2.putText(annotated_camera_frame, "Blinking", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                    
-                    if calibration_data and not is_blinking and left_iris_pos_rel and right_iris_pos_rel:
-                        gaze_point_on_monitor_abs = estimate_gaze_point(
-                            calibration_data, left_iris_pos_rel, right_iris_pos_rel, monitor_width, monitor_height)
-                        
-                        if gaze_point_on_monitor_abs:
-                            if smoothed_gaze_point_abs is None:
-                                smoothed_gaze_point_abs = gaze_point_on_monitor_abs
-                            else:
-                                smoothed_gaze_point_abs = (
-                                    int(gaze_smoothing_factor * gaze_point_on_monitor_abs[0] + (1 - gaze_smoothing_factor) * smoothed_gaze_point_abs[0]),
-                                    int(gaze_smoothing_factor * gaze_point_on_monitor_abs[1] + (1 - gaze_smoothing_factor) * smoothed_gaze_point_abs[1])
-                                )
+            # Voer MediaPipe processing minder vaak uit
+            if frame_counter_mp % process_mediapipe_every_n_frames == 0:
+                camera_frame_rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
+                results = face_mesh.process(camera_frame_rgb)
+                current_annotated_camera_frame = camera_frame.copy()
+                current_is_blinking = False
+                current_looking_direction = "center" # Default voor deze MP-verwerkingsronde
+                gaze_point_on_monitor_for_smoothing = None
 
-                            gaze_x_mon, gaze_y_mon = smoothed_gaze_point_abs 
-                            if gaze_x_mon < monitor_width * 0.33: looking_direction = "left"
-                            elif gaze_x_mon > monitor_width * 0.66: looking_direction = "right"
-                            else: looking_direction = "center"
-                            if gaze_y_mon < monitor_height * 0.33: looking_direction += " top"
-                            elif gaze_y_mon > monitor_height * 0.66: looking_direction += " bottom"
+                # Get camera dimensions early so they're available even when no face is detected
+                h_cam, w_cam, _ = camera_frame.shape
+
+                if results.multi_face_landmarks:
+                    for face_landmarks in results.multi_face_landmarks:
+                        mp_drawing.draw_landmarks(
+                            image=current_annotated_camera_frame, landmark_list=face_landmarks,
+                            connections=mp_face_mesh.FACEMESH_TESSELATION, landmark_drawing_spec=None,
+                            connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style())
+                        mp_drawing.draw_landmarks(
+                            image=current_annotated_camera_frame, landmark_list=face_landmarks,
+                            connections=mp_face_mesh.FACEMESH_IRISES, landmark_drawing_spec=None,
+                            connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_iris_connections_style())
+                        
+                        h_cam, w_cam, _ = camera_frame.shape
+                        left_iris = face_landmarks.landmark[LEFT_IRIS]
+                        right_iris = face_landmarks.landmark[RIGHT_IRIS]
+                        left_iris_px_cam = (int(left_iris.x * w_cam), int(left_iris.y * h_cam))
+                        right_iris_px_cam = (int(right_iris.x * w_cam), int(right_iris.y * h_cam))
+                        left_iris_pos_rel = (left_iris.x, left_iris.y)
+                        right_iris_pos_rel = (right_iris.x, right_iris.y)
+                        
+                        cv2.circle(current_annotated_camera_frame, left_iris_px_cam, 5, (255, 255, 0), -1) 
+                        cv2.circle(current_annotated_camera_frame, right_iris_px_cam, 5, (255, 255, 0), -1) 
+                        
+                        left_eye_top_cam = (int(face_landmarks.landmark[LEFT_EYE_TOP].y * h_cam))
+                        left_eye_bottom_cam = (int(face_landmarks.landmark[LEFT_EYE_BOTTOM].y * h_cam))
+                        right_eye_top_cam = (int(face_landmarks.landmark[RIGHT_EYE_TOP].y * h_cam))
+                        right_eye_bottom_cam = (int(face_landmarks.landmark[RIGHT_EYE_BOTTOM].y * h_cam))
+                        left_eye_height_cam = left_eye_bottom_cam - left_eye_top_cam
+                        right_eye_height_cam = right_eye_bottom_cam - right_eye_top_cam
+                        
+                        if left_eye_height_cam < 5 and right_eye_height_cam < 5: 
+                            current_is_blinking = True
+                            cv2.putText(current_annotated_camera_frame, "Blinking", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        
+                        if calibration_data and not current_is_blinking and left_iris_pos_rel and right_iris_pos_rel:
+                            gaze_point_on_monitor_for_smoothing = estimate_gaze_point(
+                                calibration_data, left_iris_pos_rel, right_iris_pos_rel, monitor_width, monitor_height)
                             
-                    elif not is_blinking: 
-                        left_eye_outer_cam = (int(face_landmarks.landmark[LEFT_EYE_OUTER].x * w_cam))
-                        left_eye_inner_cam = (int(face_landmarks.landmark[LEFT_EYE_INNER].x * w_cam))
-                        right_eye_inner_cam = (int(face_landmarks.landmark[RIGHT_EYE_INNER].x * w_cam))
-                        right_eye_outer_cam = (int(face_landmarks.landmark[RIGHT_EYE_OUTER].x * w_cam))
-                        left_eye_width_cam = left_eye_outer_cam - left_eye_inner_cam
-                        left_iris_rel_pos_cam = (left_iris_px_cam[0] - left_eye_inner_cam) / left_eye_width_cam if left_eye_width_cam > 0 else 0.5
-                        right_eye_width_cam = right_eye_inner_cam - right_eye_outer_cam
-                        right_iris_rel_pos_cam = (right_eye_inner_cam - right_iris_px_cam[0]) / right_eye_width_cam if right_eye_width_cam > 0 else 0.5
-                        avg_rel_pos = (left_iris_rel_pos_cam + right_iris_rel_pos_cam) / 2
-                        
-                        gaze_x_fallback = int(monitor_width / 2)
-                        gaze_y_fallback = int(monitor_height / 2)
-                        if avg_rel_pos < 0.35: 
-                            looking_direction = "left"; gaze_x_fallback = int(monitor_width * 0.25)
-                        elif avg_rel_pos > 0.65: 
-                            looking_direction = "right"; gaze_x_fallback = int(monitor_width * 0.75)
-                        else: 
-                            looking_direction = "center"
-                        gaze_point_on_monitor_abs = (gaze_x_fallback, gaze_y_fallback)
-                        smoothed_gaze_point_abs = gaze_point_on_monitor_abs 
+                            if gaze_point_on_monitor_for_smoothing:
+                                if last_smoothed_gaze_point_abs is None: # Eerste keer of na reset
+                                    current_smoothed_gaze_point_abs = gaze_point_on_monitor_for_smoothing
+                                else:
+                                    current_smoothed_gaze_point_abs = (
+                                        int(gaze_smoothing_factor * gaze_point_on_monitor_for_smoothing[0] + (1 - gaze_smoothing_factor) * last_smoothed_gaze_point_abs[0]),
+                                        int(gaze_smoothing_factor * gaze_point_on_monitor_for_smoothing[1] + (1 - gaze_smoothing_factor) * last_smoothed_gaze_point_abs[1])
+                                    )
+                                last_smoothed_gaze_point_abs = current_smoothed_gaze_point_abs # Update voor volgende smoothing cycle
 
-                    cv2.putText(annotated_camera_frame, f"Looking: {looking_direction}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                                gaze_x_mon, gaze_y_mon = current_smoothed_gaze_point_abs 
+                                if gaze_x_mon < monitor_width * 0.33: current_looking_direction = "left"
+                                elif gaze_x_mon > monitor_width * 0.66: current_looking_direction = "right"
+                                else: current_looking_direction = "center"
+                                if gaze_y_mon < monitor_height * 0.33: current_looking_direction += " top"
+                                elif gaze_y_mon > monitor_height * 0.66: current_looking_direction += " bottom"
+                                
+                        elif not current_is_blinking: 
+                            left_eye_outer_cam = (int(face_landmarks.landmark[LEFT_EYE_OUTER].x * w_cam))
+                            left_eye_inner_cam = (int(face_landmarks.landmark[LEFT_EYE_INNER].x * w_cam))
+                            right_eye_inner_cam = (int(face_landmarks.landmark[RIGHT_EYE_INNER].x * w_cam))
+                            right_eye_outer_cam = (int(face_landmarks.landmark[RIGHT_EYE_OUTER].x * w_cam))
+                            left_eye_width_cam = left_eye_outer_cam - left_eye_inner_cam
+                            left_iris_rel_pos_cam = (left_iris_px_cam[0] - left_eye_inner_cam) / left_eye_width_cam if left_eye_width_cam > 0 else 0.5
+                            right_eye_width_cam = right_eye_inner_cam - right_eye_outer_cam
+                            right_iris_rel_pos_cam = (right_eye_inner_cam - right_iris_px_cam[0]) / right_eye_width_cam if right_eye_width_cam > 0 else 0.5
+                            avg_rel_pos = (left_iris_rel_pos_cam + right_iris_rel_pos_cam) / 2
+                            
+                            gaze_x_fallback = int(monitor_width / 2)
+                            gaze_y_fallback = int(monitor_height / 2)
+                            if avg_rel_pos < 0.35: 
+                                current_looking_direction = "left"; gaze_x_fallback = int(monitor_width * 0.25)
+                            elif avg_rel_pos > 0.65: 
+                                current_looking_direction = "right"; gaze_x_fallback = int(monitor_width * 0.75)
+                            else: 
+                                current_looking_direction = "center"
+                            # Voor fallback, update last_smoothed_gaze_point_abs direct, geen aparte smoothing hier
+                            last_smoothed_gaze_point_abs = (gaze_x_fallback, gaze_y_fallback) 
+                else: # Geen gezicht gedetecteerd in deze MP-ronde
+                    last_smoothed_gaze_point_abs = None # Reset gaze point als gezicht weg is
+                    # Behoud de vorige looking_direction en blinking status of zet naar default
+                    current_looking_direction = last_looking_direction # of "center"? 
+                    current_is_blinking = last_is_blinking # of False? Overweeg wat logischer is.
+                    # Teken een "geen gezicht" bericht op de camera overlay als je wilt
+                    cv2.putText(current_annotated_camera_frame, "No face", (10, h_cam // 2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255),2)
 
+                cv2.putText(current_annotated_camera_frame, f"Looking: {current_looking_direction}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                last_annotated_camera_frame = current_annotated_camera_frame # Sla dit verwerkte frame op
+                last_is_blinking = current_is_blinking
+                last_looking_direction = current_looking_direction
+            
+            # --- Schermopname en samenvoegen (gebeurt elke frame) ---
             sct_img = sct.grab(monitor_grab_config) 
             screen_grab_bgr = cv2.cvtColor(np.array(sct_img), cv2.COLOR_BGRA2BGR)
 
@@ -463,17 +499,18 @@ def main():
             mouse_x_abs, mouse_y_abs = pyautogui.position()
             mouse_x_on_monitor = mouse_x_abs - monitor_left
             mouse_y_on_monitor = mouse_y_abs - monitor_top
-
             mouse_x_scaled = int(mouse_x_on_monitor * (output_video_width / monitor_width))
             mouse_y_scaled = int(mouse_y_on_monitor * (output_video_height / monitor_height))
             cv2.circle(output_frame, (mouse_x_scaled, mouse_y_scaled), 8, (0, 0, 255), -1)
 
-            if smoothed_gaze_point_abs and not is_blinking:
-                gaze_x_scaled = int(smoothed_gaze_point_abs[0] * (output_video_width / monitor_width))
-                gaze_y_scaled = int(smoothed_gaze_point_abs[1] * (output_video_height / monitor_height))
+            # Gebruik de laatst gesmoothde gaze point voor tekenen
+            if last_smoothed_gaze_point_abs and not last_is_blinking:
+                gaze_x_scaled = int(last_smoothed_gaze_point_abs[0] * (output_video_width / monitor_width))
+                gaze_y_scaled = int(last_smoothed_gaze_point_abs[1] * (output_video_height / monitor_height))
                 cv2.circle(output_frame, (gaze_x_scaled, gaze_y_scaled), 25, (255, 255, 0), 3)
 
-            resized_camera_overlay = cv2.resize(annotated_camera_frame, (overlay_cam_width, overlay_cam_height))
+            # Gebruik de laatst geannoteerde camera frame voor de overlay
+            resized_camera_overlay = cv2.resize(last_annotated_camera_frame, (overlay_cam_width, overlay_cam_height))
             if 0 <= overlay_pos_y < output_video_height and 0 <= overlay_pos_x < output_video_width and \
                overlay_pos_y + overlay_cam_height <= output_video_height and overlay_pos_x + overlay_cam_width <= output_video_width:
                 output_frame[overlay_pos_y : overlay_pos_y + overlay_cam_height, 
@@ -484,7 +521,6 @@ def main():
             preview_scale = 0.5 
             preview_width = int(output_video_width * preview_scale)
             preview_height = int(output_video_height * preview_scale)
-            
             if preview_width < 320 or preview_height < 240: 
                  if output_video_width > output_video_height:
                      preview_height = int(output_video_height * (320/output_video_width))
@@ -492,7 +528,6 @@ def main():
                  else:
                      preview_width = int(output_video_width * (240/output_video_height))
                      preview_height = 240
-
             preview_frame_resized = cv2.resize(output_frame, (preview_width, preview_height))
             cv2.imshow("UX Recorder - Live Preview", preview_frame_resized)
 
@@ -501,9 +536,8 @@ def main():
             wait_for_cv2_ms = (target_frame_time - elapsed_processing_time) * 1000
             actual_wait_ms = max(1, int(wait_for_cv2_ms))
             
-            # Diagnostische print - elke 24 frames (ongeveer elke seconde bij 24 FPS)
-            frame_count += 1
-            if frame_count % int(fps) == 0: # Print ongeveer 1x per seconde
+            frame_count_diag += 1
+            if frame_count_diag % int(fps) == 0: 
                 print(f"FPS Target: {fps:.1f} | Frame Time Target: {target_frame_time*1000:.2f}ms | Actual Proc: {elapsed_processing_time*1000:.2f}ms | WaitKey: {actual_wait_ms}ms")
 
             if cv2.waitKey(actual_wait_ms) & 0xFF == ord('q'): 
