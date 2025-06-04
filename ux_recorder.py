@@ -299,14 +299,15 @@ def main():
         print(f"Kan camera ID {chosen_camera_id} niet openen.")
         return
 
-    # Initialiseer MediaPipe FaceMesh HIER, voor kalibratie
     mp_face_mesh = mp.solutions.face_mesh
     mp_drawing = mp.solutions.drawing_utils
     mp_drawing_styles = mp.solutions.drawing_styles
     face_mesh = mp_face_mesh.FaceMesh(
-        max_num_faces=1, refine_landmarks=True,
+        static_image_mode=True, # EXPERIMENTEEL: Probeer static image mode
+        max_num_faces=1, 
+        refine_landmarks=True,
         min_detection_confidence=0.7, 
-        min_tracking_confidence=0.7)
+        min_tracking_confidence=0.7) # min_tracking_confidence wordt genegeerd als static_image_mode=True
 
     LEFT_IRIS = 468; RIGHT_IRIS = 473; LEFT_EYE_OUTER = 33; LEFT_EYE_INNER = 133
     RIGHT_EYE_INNER = 362; RIGHT_EYE_OUTER = 263; LEFT_EYE_TOP = 159; LEFT_EYE_BOTTOM = 145
@@ -342,13 +343,11 @@ def main():
     video_writer = cv2.VideoWriter(output_filename, fourcc, fps, (output_video_width, output_video_height)) 
     
     sct = mss.mss()
-    # monitor_grab_config blijft de volledige monitor voor sct.grab
     monitor_grab_config = chosen_monitor_config 
     
-    overlay_cam_width = 320 # Breedte van camera overlay op video
-    overlay_cam_height = 240 # Hoogte van camera overlay op video
+    overlay_cam_width = 240  # Verkleind van 320
+    overlay_cam_height = 180 # Verkleind van 240
     
-    # Positie camera overlay relatief aan output video resolutie
     overlay_pos_x = output_video_width - overlay_cam_width - 10 
     overlay_pos_y = output_video_height - overlay_cam_height - 10
     
